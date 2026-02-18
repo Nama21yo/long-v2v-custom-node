@@ -59,6 +59,9 @@ class LPIPS(nn.Module):
         """
         Calculate LPIPS distance between two batches of images.
         Input should be normalized to [-1, 1].
+
+        Returns:
+            Tensor with shape [batch] (or scalar when batch=1).
         """
         # 1. Extract features from both images
         outs_x = self.get_features(x)
@@ -84,8 +87,8 @@ class LPIPS(nn.Module):
             diffs.append(dist)
 
         # 4. Sum across layers
-        val = sum(diffs)
-        return val
+        val = torch.stack(diffs, dim=0).sum(dim=0)
+        return val.squeeze()
 
     def get_features(self, x):
         h = self.slice1(x)

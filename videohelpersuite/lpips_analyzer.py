@@ -16,13 +16,14 @@ import torch
 import numpy as np
 from PIL import Image
 import lpips
+from .logger import logger
 
 
 @dataclass
 class SeamAnalysis:
     """Results from analyzing a single video seam."""
     seam_index: int
-    lpips_score: float
+    lpips_score: Optional[float]
     file_a: str
     file_b: str
     frame_a_timestamp: float
@@ -31,6 +32,8 @@ class SeamAnalysis:
     
     def __post_init__(self):
         """Auto-classify quality based on LPIPS score."""
+        if self.quality_rating == 'unknown' or self.lpips_score is None or self.lpips_score < 0:
+            return
         if self.lpips_score < 0.05:
             self.quality_rating = 'excellent'
         elif self.lpips_score < 0.1:
@@ -50,6 +53,23 @@ class DriftAnalysis:
     max_drift: float
     mean_drift: float
     drift_trend: str  # 'stable', 'gradual', 'sudden'
+
+    def __post_init__(self):
+        """Auto-classify drift trend from LPIPS scores when not provided."""
+        if self.drift_trend:
+            return
+        if len(self.lpips_scores) < 3:
+            self.drift_trend = 'stable'
+            return
+        differences = [self.lpips_scores[i+1] - self.lpips_scores[i] for i in range(len(self.lpips_scores)-1)]
+        max_jump = max(abs(d) for d in differences)
+        avg_change = np.mean(np.abs(differences))
+        if max_jump > 0.2:
+            self.drift_trend = 'sudden'
+        elif avg_change > 0.05:
+            self.drift_trend = 'gradual'
+        else:
+            self.drift_trend = 'stable'
 
 
 class LPIPSAnalyzer:
@@ -86,7 +106,7 @@ class LPIPSAnalyzer:
         
         Args:
             video_files: Ordered list of video file paths
-            overlap_frames: Number of overlapping frames (unused for frame selection)
+            overlap_frames: Number of overlapping frames used to estimate transition frame positions
             ffmpeg_path: Path to FFmpeg executable
             
         Returns:
@@ -103,21 +123,29 @@ class LPIPSAnalyzer:
             
             # Get video durations
             duration_a = self._get_video_duration(file_a, ffmpeg_path)
+            fps_a = self._get_video_framerate(file_a, ffmpeg_path)
+            fps_b = self._get_video_framerate(file_b, ffmpeg_path)
             
             # Extract transition frames
-            # Last frame of video A (just before end)
-            timestamp_a = max(0.0, duration_a - 0.05)
+            # Last overlap frame of video A based on framerate
+            if duration_a <= 0.05:
+                logger.warning(f"[LPIPSAnalyzer] Very short video for seam analysis ({duration_a:.4f}s): {file_a}; using earliest frame")
+                timestamp_a = 0.0
+            else:
+                overlap_seconds_a = overlap_frames / fps_a if fps_a > 0 else 0.0
+                timestamp_a = max(0.0, duration_a - max(0.05, overlap_seconds_a))
             frame_a = self._extract_frame(file_a, timestamp_a, ffmpeg_path)
             
             # First frame of video B
-            timestamp_b = 0.0
+            overlap_seconds_b = overlap_frames / fps_b if fps_b > 0 else 0.0
+            timestamp_b = min(overlap_seconds_b, 0.05) if overlap_seconds_b > 0 else 0.0
             frame_b = self._extract_frame(file_b, timestamp_b, ffmpeg_path)
             
             if frame_a is None or frame_b is None:
                 # Fallback score if extraction fails
                 seam_results.append(SeamAnalysis(
                     seam_index=i,
-                    lpips_score=0.0,
+                    lpips_score=None,
                     file_a=file_a,
                     file_b=file_b,
                     frame_a_timestamp=timestamp_a,
@@ -177,17 +205,16 @@ class LPIPSAnalyzer:
         
         if not scores:
             raise ValueError("No valid frames extracted for drift analysis")
-        
-        # Analyze drift pattern
-        drift_trend = self._classify_drift_trend(scores)
+
+        fps = self._get_video_framerate(video_file, ffmpeg_path)
         
         return DriftAnalysis(
-            frame_numbers=[int(ts * 30) for ts in valid_timestamps],  # Assume 30fps
+            frame_numbers=[int(ts * fps) for ts in valid_timestamps],
             lpips_scores=scores,
-            reference_frame_index=int(reference_timestamp * 30),
+            reference_frame_index=int(reference_timestamp * fps),
             max_drift=max(scores),
-            mean_drift=np.mean(scores),
-            drift_trend=drift_trend
+            mean_drift=float(np.mean(scores)),
+            drift_trend=''
         )
     
     def _calculate_lpips(self, image_a: Image.Image, image_b: Image.Image) -> float:
@@ -271,10 +298,16 @@ class LPIPSAnalyzer:
                 timeout=10
             )
             
+            if result.returncode != 0:
+                stderr = (result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr))
+                logger.error(f"[LPIPSAnalyzer] FFmpeg frame extraction failed (code {result.returncode}) at {timestamp}s for {video_path}: {stderr.strip()}")
+                return None
+
             if result.stdout:
                 return Image.open(io.BytesIO(result.stdout))
+            logger.error(f"[LPIPSAnalyzer] FFmpeg produced no frame output at {timestamp}s for {video_path}")
         except Exception as e:
-            print(f"[LPIPSAnalyzer] Frame extraction failed: {e}")
+            logger.error(f"[LPIPSAnalyzer] Frame extraction failed: {e}")
         
         return None
     
@@ -306,6 +339,30 @@ class LPIPSAnalyzer:
             return hours * 3600 + minutes * 60 + seconds
         
         return 0.0
+
+    def _get_video_framerate(self, video_path: str, ffmpeg_path: str) -> float:
+        """Get video framerate from FFmpeg stream info, fallback to 30fps."""
+        cmd = [ffmpeg_path, '-i', video_path]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        import re
+        stderr = result.stderr or ""
+        match = re.search(r"(\d+(?:\.\d+)?)\s*fps", stderr)
+        if match:
+            try:
+                fps = float(match.group(1))
+                if fps > 0:
+                    return fps
+            except ValueError:
+                pass
+
+        logger.warning(f"[LPIPSAnalyzer] Could not parse FPS for {video_path}; defaulting to 30.0")
+        return 30.0
     
     def _classify_drift_trend(self, scores: List[float]) -> str:
         """
@@ -354,17 +411,30 @@ def get_summary_statistics(seam_analyses: List[SeamAnalysis]) -> Dict:
             'quality_distribution': {}
         }
     
-    scores = [s.lpips_score for s in seam_analyses]
+    scored_analyses = [s for s in seam_analyses if s.lpips_score is not None and s.lpips_score >= 0]
+    scores = [float(s.lpips_score) for s in scored_analyses if s.lpips_score is not None]
     quality_counts = {}
     for s in seam_analyses:
         quality_counts[s.quality_rating] = quality_counts.get(s.quality_rating, 0) + 1
+
+    if not scores:
+        return {
+            'total_seams': len(seam_analyses),
+            'mean_score': 0.0,
+            'max_score': 0.0,
+            'min_score': 0.0,
+            'std_score': 0.0,
+            'quality_distribution': quality_counts,
+            'worst_seam_index': -1,
+            'best_seam_index': -1
+        }
     
     return {
         'total_seams': len(seam_analyses),
-        'mean_score': np.mean(scores),
-        'max_score': np.max(scores),
-        'min_score': np.min(scores),
-        'std_score': np.std(scores),
+    'mean_score': float(np.mean(scores)),
+    'max_score': float(np.max(scores)),
+    'min_score': float(np.min(scores)),
+    'std_score': float(np.std(scores)),
         'quality_distribution': quality_counts,
         'worst_seam_index': int(np.argmax(scores)),
         'best_seam_index': int(np.argmin(scores))
