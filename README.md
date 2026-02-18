@@ -1,6 +1,40 @@
 # ComfyUI-VideoHelperSuite
 Nodes related to video workflows
 
+## Advanced Long-Form Video Tools
+
+New in v2.0: A suite of nodes designed for **production-grade long-form video generation**, specifically targeting temporal consistency, batch stitching, and quality analysis.
+
+### Frame-by-Frame Processor
+
+A logic-driven video processor that handles long videos by breaking them into manageable batches with intelligent context overlap.
+
+* **Context Aware:** Uses a sliding window (stride) with configurable overlap to ensure the model "remembers" the previous frames, preventing the "amnesia" effect common in long AI videos.
+* **Memory Safe:** Automatically manages VRAM by offloading unused batches, allowing for infinite-length video generation on consumer GPUs.
+* **Drift Prevention:** Injects reference latents from previous batches to maintain character identity over hundreds of frames.
+
+### Video Merger
+
+A stitching node that replaces hard cuts with dynamic blending.
+
+* **Seam Correction:** Automatically detects the end of Batch A and the start of Batch B.
+* **Dynamic Cross-Fade:** Instead of a hard append, it performs a mathematically smoothed linear interpolation (cross-fade) between batches to hide generation artifacts.
+* **Audio Sync:** Preserves and stitches audio tracks alongside video frames.
+
+### LPIPS Analyzer (Consistency Metric)
+
+A research-grade analysis node that quantitatively measures **temporal drift**.
+
+* **Perceptual Distance:** Uses **LPIPS (Learned Perceptual Image Patch Similarity)** to calculate how much the current frame deviates from the reference frame.
+* **Drift Alert:** Outputs a score (0.0 - 1.0). If the score exceeds a threshold (e.g., 0.3), it can trigger a workflow interrupt or a regeneration loop.
+
+### Quality Visualizer
+
+A dashboard node for "Human-in-the-Loop" review.
+
+* **Real-Time Plotting:** Generates a Matplotlib graph showing the stability curve of your generation.
+* **Visual Debugging:** Instantly spot which specific batch caused the video to "collapse" or lose quality, saving you from watching the entire render to find errors.
+
 ## I/O Nodes
 ### Load Video
 Converts a video file into a series of images
